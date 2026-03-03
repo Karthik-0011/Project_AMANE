@@ -1,0 +1,11 @@
+# Credentials
+.env
+
+# Python Virtual Environment
+venv/
+__pycache__/
+*.pyc
+
+# Local Data/VTube Studio logs
+*.log
+memory.json
