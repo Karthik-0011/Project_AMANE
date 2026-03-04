@@ -9,3 +9,8 @@ __pycache__/
 # Local Data/VTube Studio logs
 *.log
 memory.json
+
+tokens/
+*.txt
+# (optional: if only this file is sensitive, prefer the specific ignore)
+# tokens/vts_token.txt

@@ -7,68 +7,60 @@ sys.path.append(current_dir)
 
 from brain import Brain
 from voice import Voice
-from visual import Visual
+# from visual import Visual  # Temporarily disabled
 
 async def start_amane():
+    print("\n⏳ Waking up AMANE... (Loading Neural and Acoustic Engines)")
+    
+    # Initialize components
     brain = Brain()
     voice = Voice()
-    visual = Visual()
+    # visual = Visual()  # Temporarily disabled
 
-    print("\n✨ --- AMANE VOICE AI ONLINE ---")
-    print("🎤 Start speaking!")
-    print("💬 Say 'exit' to quit\n")
+    print("\n✨ --- AMANE ONLINE --- ✨")
+    print("💬 Say 'exit', 'bye', or 'quit' to shut down.\n")
     
-    visual.set_state("idle", "Ready - Start speaking!")
+    # Startup Greeting: Tests the TTS engine immediately upon boot
+    await voice.speak("Hello Master. I am online and ready for you.")
     
     while True:
         try:
-            # Update GUI
-            visual.update()
-            
             # LISTENING STATE
-            visual.set_state("listening", "Listening...")
-            user_msg = await voice.listen(timeout=30)
+            # Note: timeout=None allows her to wait patiently without randomly timing out
+            user_msg = await voice.listen(timeout=None) 
             
             if not user_msg:
-                visual.set_state("idle", "Ready")
                 continue
                 
-            print(f"\n👤 You: {user_msg}")
-            
-            # Exit check
-            if any(w in user_msg.lower() for w in ["exit", "bye", "quit"]):
-                visual.set_state("talking", "Goodbye!")
-                await voice.speak("Goodbye! See you later!")
+            # Exit check (Checks if you want to close the program)
+            if any(w in user_msg.lower() for w in ["exit", "bye", "quit", "goodbye"]):
+                await voice.speak("Goodbye! Shutting down my systems now.")
+                print("\n👋 AMANE powered off.")
                 break
 
             # THINKING STATE
-            visual.set_state("thinking", "Thinking...")
-            print("🤔 Thinking...")
             reply = await brain.think(user_msg)
             
             # TALKING STATE
-            visual.set_state("talking", "Speaking...")
             await voice.speak(reply)
             
-            # Back to idle
-            visual.set_state("idle", "Ready")
-            print()
-            
-            # Small delay to let GUI update
+            # Small delay to let the CPU breathe
             await asyncio.sleep(0.1)
             
         except KeyboardInterrupt:
-            print("\n👋 Shutting down...")
+            print("\n👋 Manual shutdown detected...")
             break
         except Exception as e:
-            print(f"❌ Error: {e}")
-            visual.set_state("idle", "Error - Try again")
-            await voice.speak("Sorry, I had an error. Try again?")
-    
-    visual.close()
+            print(f"❌ Main Loop Error: {e}")
+            await voice.speak("I'm sorry, my core loop encountered an error. Let's try that again.")
+            await asyncio.sleep(1)
 
 if __name__ == "__main__":
     try:
+        # Crucial fix for Windows machines running asyncio audio loops
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
         asyncio.run(start_amane())
     except KeyboardInterrupt:
-        print("\n👋 Goodbye!")
+        print("\n👋 Force Quit. Goodbye!")
