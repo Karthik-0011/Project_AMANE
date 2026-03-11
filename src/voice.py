@@ -1,103 +1,102 @@
-import edge_tts
 import pygame
 import asyncio
 import speech_recognition as sr
 import os
 import tempfile
 import re
+import torch
 from faster_whisper import WhisperModel
+from TTS.api import TTS
 
 class Voice:
-    def __init__(self, voice_name="en-US-AriaNeural"):
-        self.default_voice = voice_name
-        pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+    def __init__(self):
+        # --- PATH SETUP ---
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
+        self.voice_sample = os.path.join(project_root, "media", "vocal2use.wav")
         
-        # 1. Initialize the Real AI Ears
-        print("🧠 Loading Whisper AI... (Waking up AMANE's ears)")
-        self.model = WhisperModel("base", device="cuda", compute_type="float16")
-        
-        # 2. Reset the Microphone to clean, reliable defaults
-        self.recognizer = sr.Recognizer()
-        self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.7  # Gives you a second to breathe
-        self.microphone = sr.Microphone()
-        
-        print("🎤 Microphone calibrated and ready.")
+        if not os.path.exists(self.voice_sample):
+            print(f"❌ ERROR: Missing {self.voice_sample}")
 
-    async def listen(self, timeout=None):
-        """Listen for user voice input and translate/transcribe via Whisper"""
+        # OpenVoice V2 standard is often 24kHz. Matching this for clean playback
+        pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=1024)
+        
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # 1. Initialize Whisper (The Ears)
+        print(f"🧠 Loading Whisper AI on {self.device.upper()}...")
+        self.whisper = WhisperModel("base", device=self.device, compute_type="float16" if self.device == "cuda" else "int8")
+        
+        # 2. Initialize OpenVoice v2 (The stable Mouth)
+        print("👄 Loading OpenVoice v2... (Stable Voice Cloning)")
+        self.tts = TTS("voice_conversion_models/multilingual/multi-dataset/openvoice_v2").to(self.device)
+        print("✨ AMANE System Online.")
+
+        # 3. Microphone Setup
+        self.recognizer = sr.Recognizer()
+        self.microphone = sr.Microphone()
+
+    async def listen(self):
+        """Listen and transcribe using Whisper"""
         try:
-            print("\n🎤 AMANE is listening... (Speak in English, Japanese, Hindi, etc.)")
-            
+            print("\n🎤 Listening...")
             with self.microphone as source:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=20)
+                audio = self.recognizer.listen(source, timeout=10, phrase_time_limit=15)
             
-            print("🔄 Processing...")
-
-            # Save the raw audio to a temporary file
-            wav_data = audio.get_wav_data()
+            # Save to temp for Whisper processing
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                f.write(wav_data)
+                f.write(audio.get_wav_data())
                 temp_wav = f.name
 
-            # Run Whisper transcription
+            # Offload heavy transcription to background thread
             loop = asyncio.get_event_loop()
-            def transcribe_audio():
-                segments, info = self.model.transcribe(temp_wav, beam_size=5)
-                text = "".join([segment.text for segment in segments])
-                return text, info.language
+            def transcribe():
+                segments, info = self.whisper.transcribe(temp_wav, beam_size=5)
+                return "".join([s.text for s in segments])
 
-            text, language = await loop.run_in_executor(None, transcribe_audio)
-            
+            text = await loop.run_in_executor(None, transcribe)
             os.remove(temp_wav)
             
             if text.strip():
-                print(f"✅ Heard [{language.upper()}]: {text.strip()}")
+                print(f"✅ Heard: {text.strip()}")
                 return text.strip()
             return None
             
-        except sr.WaitTimeoutError:
-            return None
         except Exception as e:
-            print(f"❌ Microphone/Whisper error: {e}")
+            print(f"❌ Ears error: {e}")
             return None
 
-    async def speak(self, text, rate="+0%"):
-        """Convert text to speech dynamically based on language"""
+    async def speak(self, text):
+        """Clone voice using OpenVoice v2 Tone Color Conversion"""
         try:
             print(f"🗣️ AMANE: {text}")
             
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
                 audio_file = temp_file.name
             
-            # --- DYNAMIC VOICE SWITCHER ---
-            current_voice = self.default_voice  # Start with English (Aria)
+            # Japanese detection
+            lang = "ja" if re.search(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]', text) else "en"
             
-            # If the text contains Japanese Kanji/Hiragana/Katakana, switch to Nanami
-            if re.search(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]', text):
-                current_voice = "ja-JP-NanamiNeural"
-                print("🌸 (Voice Switched to Japanese Module)")
+            def generate():
+                # OpenVoice v2 focuses on Tone Color. No more 'chirping' parameters needed.
+                self.tts.tts_to_file(
+                    text=text, 
+                    speaker_wav=self.voice_sample, 
+                    language=lang, 
+                    file_path=audio_file
+                )
             
-            # Generate speech
-            communicate = edge_tts.Communicate(text, current_voice, rate=rate)
-            await communicate.save(audio_file)
+            await asyncio.get_event_loop().run_in_executor(None, generate)
             
-            # Play audio
+            # Playback
             pygame.mixer.music.load(audio_file)
             pygame.mixer.music.play()
-            
-            # Wait for playback to finish
             while pygame.mixer.music.get_busy():
                 await asyncio.sleep(0.05)
             
-            # Cleanup
             pygame.mixer.music.unload()
-            await asyncio.sleep(0.1)
-            try:
-                os.remove(audio_file)
-            except:
-                pass
+            os.remove(audio_file)
                 
         except Exception as e:
-            print(f"❌ Voice Output error: {e}")
+            print(f"❌ Mouth error: {e}")
