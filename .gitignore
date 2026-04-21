@@ -1,16 +1,31 @@
 # Credentials
 .env
 
+# VS Code
+.vscode/
+
+# Actual virtual environment
+.venv/
+
 # Python Virtual Environment
 venv/
 __pycache__/
 *.pyc
+share/
+
+pyvenv.cfg
+
+# Temp/generated audio
+amane_temp.wav
 
 # Local Data/VTube Studio logs
 *.log
 memory.json
 
+# Media outputs (ignore if not source assets)
+Media/
+
 tokens/
-*.txt
-# (optional: if only this file is sensitive, prefer the specific ignore)
-# tokens/vts_token.txt
+# Ignore token text files specifically (not all .txt files)
+tokens/*.txt
+tokens/vts_token.txt

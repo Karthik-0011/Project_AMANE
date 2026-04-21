@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AMANE Project</title>
+    <style>
+        body { background: #1a1a1a; color: #fff; font-family: sans-serif; text-align: center; }
+        #status { color: #00ffcc; margin-top: 20px; }
+        .visualizer { width: 100%; height: 100px; background: #333; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <h1>AMANE System Interface</h1>
+    <div id="status">Ready. Click anywhere to start AMANE.</div>
+    <div id="chat"></div>
+
+<script>
+    const statusEl = document.getElementById('status');
+    const chatEl = document.getElementById('chat');
+
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${wsProtocol}://${window.location.host}/ws`);
+    socket.binaryType = 'arraybuffer';
+
+    let audioContext = null;
+    let audioQueue = [];
+    let isPlaying = false;
+    let currentSource = null;
+    let assistantSpeaking = false;
+    let started = false;
+    let decodeChain = Promise.resolve();
+    let decodeToken = 0;
+    let assistantStreamDiv = null;
+    let assistantStreamText = '';
+
+    function appendChat(line) {
+        const div = document.createElement('div');
+        div.textContent = line;
+        chatEl.appendChild(div);
+    }
+
+    function startAssistantStream() {
+        assistantStreamDiv = document.createElement('div');
+        assistantStreamText = '';
+        assistantStreamDiv.textContent = 'AMANE: ';
+        chatEl.appendChild(assistantStreamDiv);
+    }
+
+    function endAssistantStream() {
+        assistantStreamDiv = null;
+        assistantStreamText = '';
+    }
+
+    function stopAssistantAudio() {
+        decodeToken++;
+        audioQueue = [];
+        if (currentSource) {
+            try { currentSource.stop(); } catch (_) {}
+            currentSource = null;
+        }
+        isPlaying = false;
+        assistantSpeaking = false;
+        endAssistantStream();
+    }
+
+    async function playNextInQueue() {
+        if (!audioContext) return;
+        if (audioQueue.length === 0 || isPlaying) {
+            if (audioQueue.length === 0 && !isPlaying) {
+                assistantSpeaking = false;
+            }
+            return;
+        }
+
+        assistantSpeaking = true;
+        isPlaying = true;
+
+        const item = audioQueue.shift();
+        let audioBuffer = item;
+        if (!(item instanceof AudioBuffer)) {
+            audioBuffer = await audioContext.decodeAudioData(item.slice(0));
+        }
+
+        currentSource = audioContext.createBufferSource();
+        currentSource.buffer = audioBuffer;
+        currentSource.connect(audioContext.destination);
+        currentSource.onended = () => {
+            isPlaying = false;
+            currentSource = null;
+            if (audioQueue.length === 0) {
+                assistantSpeaking = false;
+            }
+            playNextInQueue();
+        };
+        currentSource.start();
+    }
+
+    function sendInterrupt() {
+        if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'interrupt' }));
+        }
+    }
+
+    function floatTo16BitPCM(view, offset, input) {
+        for (let i = 0; i < input.length; i++, offset += 2) {
+            let s = Math.max(-1, Math.min(1, input[i]));
+            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        }
+    }
+
+    function writeString(view, offset, string) {
+        for (let i = 0; i < string.length; i++) {
+            view.setUint8(offset + i, string.charCodeAt(i));
+        }
+    }
+
+    function encodeWAV(samples, sampleRate) {
+        const buffer = new ArrayBuffer(44 + samples.length * 2);
+        const view = new DataView(buffer);
+
+        writeString(view, 0, 'RIFF');
+        view.setUint32(4, 36 + samples.length * 2, true);
+        writeString(view, 8, 'WAVE');
+        writeString(view, 12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeString(view, 36, 'data');
+        view.setUint32(40, samples.length * 2, true);
+
+        floatTo16BitPCM(view, 44, samples);
+        return buffer;
+    }
+
+    function flattenChunks(chunks) {
+        let length = 0;
+        for (const c of chunks) length += c.length;
+        const result = new Float32Array(length);
+        let offset = 0;
+        for (const c of chunks) {
+            result.set(c, offset);
+            offset += c.length;
+        }
+        return result;
+    }
+
+    function downsampleBuffer(buffer, inputRate, outputRate) {
+        if (outputRate === inputRate) return buffer;
+        if (outputRate > inputRate) throw new Error('Downsampling rate must be <= input rate');
+
+        const ratio = inputRate / outputRate;
+        const newLength = Math.round(buffer.length / ratio);
+        const result = new Float32Array(newLength);
+
+        let offsetResult = 0;
+        let offsetBuffer = 0;
+        while (offsetResult < result.length) {
+            const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+            let accum = 0;
+            let count = 0;
+            for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                accum += buffer[i];
+                count++;
+            }
+            result[offsetResult] = count > 0 ? (accum / count) : 0;
+            offsetResult++;
+            offsetBuffer = nextOffsetBuffer;
+        }
+        return result;
+    }
+
+    async function startAMANE() {
+        if (started) return;
+        started = true;
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        await audioContext.resume();
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: { ideal: true },
+                noiseSuppression: { ideal: true },
+                autoGainControl: { ideal: true },
+                channelCount: { ideal: 1 }
+            }
+        });
+
+        const micSource = audioContext.createMediaStreamSource(stream);
+        const processor = audioContext.createScriptProcessor(2048, 1, 1);
+        const zeroGain = audioContext.createGain();
+        zeroGain.gain.value = 0;
+
+        micSource.connect(processor);
+        processor.connect(zeroGain);
+        zeroGain.connect(audioContext.destination);
+
+        const TARGET_RATE = 16000;
+        const PRE_ROLL_MS = 250;
+
+        let preRollChunks = [];
+        let recordChunks = [];
+        let isRecording = false;
+        let voiceFrames = 0;
+        let silenceFrames = 0;
+        let utteranceStartMs = 0;
+        let noiseFloorDb = -60;
+
+        function chunkDurationMs() {
+            return (processor.bufferSize / audioContext.sampleRate) * 1000;
+        }
+
+        function maxPreRollChunksCount() {
+            return Math.max(1, Math.ceil(PRE_ROLL_MS / chunkDurationMs()));
+        }
+
+        function computeDb(input) {
+            let sum = 0;
+            for (let i = 0; i < input.length; i++) {
+                const x = input[i];
+                sum += x * x;
+            }
+            const rms = Math.sqrt(sum / input.length);
+            return 20 * Math.log10(rms + 1e-8);
+        }
+
+        async function finalizeAndSend() {
+            const merged = flattenChunks(recordChunks);
+            recordChunks = [];
+
+            // Skip ultra-short bursts.
+            if (merged.length < audioContext.sampleRate * 0.25) {
+                return;
+            }
+
+            const downsampled = downsampleBuffer(merged, audioContext.sampleRate, TARGET_RATE);
+            const wav = encodeWAV(downsampled, TARGET_RATE);
+            if (socket.readyState === WebSocket.OPEN) {
+                socket.send(wav);
+            }
+        }
+
+        function startRecording() {
+            isRecording = true;
+            utteranceStartMs = performance.now();
+            // Pre-roll helps not cut off the beginning of speech.
+            recordChunks = preRollChunks.slice();
+            preRollChunks = [];
+            voiceFrames = 0;
+            silenceFrames = 0;
+            statusEl.innerText = 'Listening...';
+        }
+
+        function stopRecording() {
+            isRecording = false;
+            voiceFrames = 0;
+            silenceFrames = 0;
+            statusEl.innerText = 'Thinking...';
+            finalizeAndSend();
+        }
+
+        processor.onaudioprocess = (e) => {
+            const input = e.inputBuffer.getChannelData(0);
+            const db = computeDb(input);
+
+            // Update noise floor only when AMANE isn't speaking.
+            if (!assistantSpeaking && !isRecording) {
+                // Pull noise floor slowly toward quieter readings.
+                if (db < noiseFloorDb + 6) {
+                    noiseFloorDb = noiseFloorDb * 0.97 + db * 0.03;
+                }
+            }
+
+            const extraDb = assistantSpeaking ? 20 : 12;
+            const thresholdDb = noiseFloorDb + extraDb;
+            const isVoice = db > thresholdDb;
+
+            // Maintain pre-roll while not recording.
+            if (!isRecording) {
+                preRollChunks.push(new Float32Array(input));
+                while (preRollChunks.length > maxPreRollChunksCount()) {
+                    preRollChunks.shift();
+                }
+            }
+
+            if (!isRecording) {
+                if (isVoice) {
+                    voiceFrames++;
+                } else {
+                    voiceFrames = 0;
+                }
+
+                const startFrames = assistantSpeaking ? 6 : 3;
+                if (voiceFrames >= startFrames) {
+                    if (assistantSpeaking) {
+                        // BARGE-IN: user started talking while AMANE was speaking.
+                        stopAssistantAudio();
+                        sendInterrupt();
+                    }
+                    startRecording();
+                }
+                return;
+            }
+
+            // Recording path
+            recordChunks.push(new Float32Array(input));
+
+            const now = performance.now();
+            if (now - utteranceStartMs > 15000) {
+                stopRecording();
+                return;
+            }
+
+            if (isVoice) {
+                silenceFrames = 0;
+            } else {
+                silenceFrames++;
+            }
+
+            if (silenceFrames >= 8) {
+                // ~500ms of silence depending on buffer size.
+                stopRecording();
+            }
+        };
+
+        statusEl.innerText = 'AMANE is listening...';
+    }
+
+    socket.onopen = () => {
+        statusEl.innerText = 'Ready. Click anywhere to start AMANE.';
+    };
+
+    socket.onmessage = async (event) => {
+        if (typeof event.data === 'string') {
+            const msg = JSON.parse(event.data);
+
+            if (msg.type === 'interrupt') {
+                stopAssistantAudio();
+                return;
+            }
+
+            if (msg.type === 'assistant_start') {
+                endAssistantStream();
+                startAssistantStream();
+                return;
+            }
+
+            if (msg.type === 'assistant_delta') {
+                if (!assistantStreamDiv) startAssistantStream();
+                assistantStreamText += (msg.text || '');
+                assistantStreamDiv.textContent = 'AMANE: ' + assistantStreamText;
+                return;
+            }
+
+            if (msg.type === 'assistant_end') {
+                endAssistantStream();
+                return;
+            }
+
+            if (msg.type === 'transcription') {
+                appendChat('You: ' + msg.text);
+                return;
+            }
+
+            if (msg.type === 'sentence') {
+                appendChat('AMANE: ' + msg.text);
+                return;
+            }
+
+            if (msg.type === 'done') {
+                endAssistantStream();
+                return;
+            }
+
+            if (msg.type === 'headlines' && Array.isArray(msg.items)) {
+                appendChat('Headlines:');
+                for (const item of msg.items) {
+                    const a = document.createElement('a');
+                    a.href = item.link || '#';
+                    a.target = '_blank';
+                    a.rel = 'noopener noreferrer';
+                    a.textContent = '• ' + (item.title || '');
+                    const div = document.createElement('div');
+                    div.appendChild(a);
+                    chatEl.appendChild(div);
+                }
+                return;
+            }
+
+            return;
+        }
+
+        // Binary audio frame (WAV)
+        const buf = event.data;
+        const myToken = decodeToken;
+
+        if (!audioContext) {
+            audioQueue.push(buf);
+            playNextInQueue();
+            return;
+        }
+
+        // Decode as soon as it arrives (and in order) to avoid gaps.
+        decodeChain = decodeChain.then(async () => {
+            try {
+                const decoded = await audioContext.decodeAudioData(buf.slice(0));
+                if (myToken !== decodeToken) return; // Dropped due to interrupt.
+                audioQueue.push(decoded);
+                playNextInQueue();
+            } catch (e) {
+                console.error('Audio decode failed', e);
+            }
+        });
+    };
+
+    window.onclick = () => {
+        startAMANE();
+    };
+</script>
+</body>
+</html>

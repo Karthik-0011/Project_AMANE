@@ -1,96 +1,109 @@
-import pygame
 import asyncio
-import speech_recognition as sr
-import os
-import re
-import torch
-import numpy as np
 import io
 import warnings
+
+import numpy as np
+import soundfile as sf
+import torch
 from faster_whisper import WhisperModel
 from kokoro import KPipeline
 
-# Silence technical noise
 warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
 
 class Voice:
     def __init__(self):
-        # 1. High-fidelity audio setup
-        pygame.mixer.init(frequency=24000, size=-16, channels=2, buffer=2048)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.compute_type = "float16" if self.device == "cuda" else "int8"
+        
+        print(f"👂 Loading Whisper (Ears) on {self.device}...")
+        self.whisper = WhisperModel(
+            "tiny",
+            device=self.device,
+            compute_type=self.compute_type,
+        )
 
-        # 2. The "Ears"
-        print(f"🧠 Loading Whisper on {self.device.upper()}...")
-        self.whisper = WhisperModel("base", device=self.device, compute_type="float16")
-
-        # 3. The "Mouth" (Using American English Pipeline)
-        print("👄 Loading Kokoro-82M (Emotional 'Nicole' Voice)...")
+        print("👄 Loading Kokoro (Nicole Voice)...")
+        # 'a' for English, using the Nicole identity
         self.pipeline = KPipeline(lang_code='a', device=self.device, repo_id='hexgrad/Kokoro-82M')
+        self.voice_name = 'af_bella'
 
-        # 'af_nicole' is the most "human/emotional" female voice in the set.
-        self.current_voice = 'af_nicole' 
-
-        self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
-
-    def _clean(self, text: str) -> str:
-        """Strip LLM artifacts like *whispers* or [thinks]."""
-        lines = []
-        for line in text.splitlines():
-            s = line.strip()
-            if not s or re.fullmatch(r'[.\s…]+', s) or re.fullmatch(r'[\(\*][^\)\*]+[\)\*]', s):
-                continue
-            lines.append(s)
-        return " ".join(lines).strip()
-
-    def _to_sound(self, audio) -> pygame.mixer.Sound:
-        """Convert Kokoro output to Pygame audio."""
-        if hasattr(audio, 'numpy'):
-            audio = audio.numpy()
-        pcm = (audio * 32767).astype(np.int16)
-        if pcm.ndim == 1:
-            pcm = np.column_stack((pcm, pcm))
-        return pygame.sndarray.make_sound(pcm)
-
-    async def listen(self) -> str | None:
-        try:
-            print("\n🎤 Listening...")
-            with self.microphone as source:
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = self.recognizer.listen(source, timeout=10, phrase_time_limit=15)
-
-            audio_data = io.BytesIO(audio.get_wav_data())
-            loop = asyncio.get_event_loop()
+    def generate_audio_bytes(self, text: str):
+        """Generates WAV bytes for a single sentence."""
+        generator = self.pipeline(text, voice=self.voice_name, speed=0.88)
+        
+        for _, (_, _, audio) in enumerate(generator):
+            # Convert float32 to int16 PCM
+            audio_int16 = (audio.cpu().numpy() * 32767).astype(np.int16)
             
-            def transcribe():
-                segments, _ = self.whisper.transcribe(audio_data, beam_size=5)
-                return "".join(s.text for s in segments)
+            # Create a WAV file in memory
+            byte_io = io.BytesIO()
+            sf.write(byte_io, audio_int16, 24000, format='WAV')
+            yield byte_io.getvalue()
 
-            text = await loop.run_in_executor(None, transcribe)
-            if text and text.strip():
-                print(f"✅ Heard: {text.strip()}")
-                return text.strip()
-        except Exception as e:
-            print(f"❌ Ears error: {e}")
-        return None
-
-    async def speak(self, text: str):
-        """Speaks with an emotional, human-like cadence."""
+    def _decode_audio_to_mono_float32(self, audio_bytes: bytes) -> tuple[np.ndarray, int] | tuple[None, None]:
         try:
-            text = self._clean(text)
-            if not text:
-                return
-            print(f"🗣️ AMANE: {text}")
+            audio, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+        except Exception:
+            return None, None
 
-            # 0.88 speed makes the 'Nicole' voice sound very personal and calm.
-            generator = self.pipeline(text, voice=self.current_voice, speed=0.88, split_pattern=r'\n+')
+        if audio.size == 0:
+            return None, None
 
-            for _, (_, _, audio) in enumerate(generator):
-                sound = self._to_sound(audio)
-                channel = sound.play()
-                while channel.get_busy():
-                    await asyncio.sleep(0.05)
+        # Mixdown to mono.
+        audio_mono = np.mean(audio, axis=1)
+        return audio_mono, int(sample_rate)
 
+    def _resample_linear(self, audio: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
+        if from_rate == to_rate:
+            return audio
+        if audio.size == 0:
+            return audio
+
+        duration_s = audio.size / float(from_rate)
+        target_length = int(duration_s * to_rate)
+        if target_length <= 1:
+            return np.asarray([], dtype=np.float32)
+
+        x_old = np.linspace(0.0, duration_s, num=audio.size, endpoint=False)
+        x_new = np.linspace(0.0, duration_s, num=target_length, endpoint=False)
+        return np.interp(x_new, x_old, audio).astype(np.float32)
+
+    def _transcribe_sync(self, audio_bytes: bytes) -> str | None:
+        if not audio_bytes or len(audio_bytes) < 2048:  # Ignore tiny noise
+            return None
+
+        # Prefer WAV/PCM decode via soundfile so we don't depend on ffmpeg.
+        audio, sample_rate = self._decode_audio_to_mono_float32(audio_bytes)
+        if audio is None or sample_rate is None:
+            # Fallback: let faster-whisper try to decode (may require ffmpeg/pyav).
+            audio_file = io.BytesIO(audio_bytes)
+            segments, _ = self.whisper.transcribe(audio_file, beam_size=1, vad_filter=True)
+        else:
+            if sample_rate != 16000:
+                audio = self._resample_linear(audio, sample_rate, 16000)
+            segments, _ = self.whisper.transcribe(audio, beam_size=1, vad_filter=True)
+
+        text = "".join(s.text for s in segments).strip()
+
+        # BLOCK LIST: common hallucination fragments.
+        ignore_list = {
+            "嗨",
+            "嗨。",
+            "嗨嗨嗨",
+            "嗨 嗨 嗨",
+            "Thank you.",
+            "Thanks for watching.",
+            "Please subscribe",
+            "you",
+        }
+        if not text or len(text) < 2 or text in ignore_list:
+            return None
+
+        return text
+
+    async def transcribe(self, audio_bytes: bytes) -> str | None:
+        try:
+            return await asyncio.to_thread(self._transcribe_sync, audio_bytes)
         except Exception as e:
-            print(f"❌ Mouth error: {e}")
+            print(f"⚠️ Transcription error: {e}")
+            return None
